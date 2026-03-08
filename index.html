@@ -6,16 +6,66 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no"
     />
-    <title>Countino React - Domino Pip Counter</title>
+    <title>Countino - Domino Pip Counter MVP</title>
     <link rel="stylesheet" href="styles.css" />
-    <!-- OpenCV.js for in-browser computer vision -->
     <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
-    <!-- React runtime (no build step required) -->
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   </head>
   <body>
-    <div id="root"></div>
+    <main class="app-shell">
+      <header class="card">
+        <h1>Countino</h1>
+        <p class="subtitle">Mobile-first domino pip counting from camera or photo.</p>
+      </header>
+
+      <section class="card">
+        <div class="camera-frame">
+          <video id="camera" class="camera-layer" autoplay playsinline muted></video>
+          <canvas id="overlayCanvas" class="camera-layer overlay-layer"></canvas>
+        </div>
+      </section>
+
+      <section class="controls">
+        <button id="scanBtn" class="primary" type="button" disabled>Scan Dominoes</button>
+        <button id="resetBtn" class="secondary" type="button">Reset</button>
+      </section>
+
+      <section class="card fallback-card">
+        <h2>Fallback Photo Upload</h2>
+        <p class="muted">Use this if camera access is blocked.</p>
+        <input id="uploadInput" type="file" accept="image/*" capture="environment" />
+      </section>
+
+      <section class="card" aria-live="polite">
+        <h2>Scan Results</h2>
+        <p class="metric"><strong>Total pip count:</strong> <span id="totalPips">0</span></p>
+        <p class="metric"><strong>Dominoes detected:</strong> <span id="dominoCount">0</span></p>
+        <p class="metric"><strong>Pips per domino:</strong> <span id="perDomino">-</span></p>
+        <p id="status" class="status">Initializing camera...</p>
+      </section>
+
+      <section class="card debug-card">
+        <div class="debug-header">
+          <h2>Debug View</h2>
+          <label class="inline-toggle" for="debugToggle">
+            <input id="debugToggle" type="checkbox" />
+            <span>Show</span>
+          </label>
+        </div>
+        <div id="debugControls" class="debug-controls" hidden>
+          <label for="debugStage">Step</label>
+          <select id="debugStage">
+            <option value="normalized">Normalized gray</option>
+            <option value="threshold">Adaptive threshold</option>
+            <option value="edges">Canny edges</option>
+            <option value="combined" selected>Combined mask</option>
+            <option value="pip">Latest pip mask</option>
+          </select>
+        </div>
+        <canvas id="debugCanvas" class="debug-canvas" hidden></canvas>
+      </section>
+    </main>
+
+    <canvas id="captureCanvas" hidden></canvas>
     <script src="app.js"></script>
   </body>
 </html>
