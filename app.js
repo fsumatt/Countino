@@ -319,10 +319,27 @@ Ideas to improve accuracy
         threshold,
         255,
         cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv.THRESH_BINARY_INV,
-        41,
-        7
+        cv.THRESH_BINARY,
+        35,
+        -4
       );
+      cv.threshold(blur, brightMask, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      cv.bitwise_or(threshold, brightMask, threshold);
+
+      cv.Canny(blur, edges, 45, 120);
+      const edgeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+      cv.dilate(edges, edges, edgeKernel);
+      cv.bitwise_or(threshold, edges, combined);
+      cv.morphologyEx(combined, combined, cv.MORPH_CLOSE, edgeKernel);
+      cv.morphologyEx(combined, combined, cv.MORPH_OPEN, edgeKernel);
+      edgeKernel.delete();
+      blur.delete();
+      brightMask.delete();
+
+      storeDebugMat("normalized", normalized);
+      storeDebugMat("threshold", threshold);
+      storeDebugMat("edges", edges);
+      storeDebugMat("combined", combined);
 
       cv.Canny(normalized, edges, 60, 130);
       const edgeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
