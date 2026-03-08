@@ -1,0 +1,159 @@
+:root {
+  color-scheme: dark;
+  --bg: #11141d;
+  --card: #1c2130;
+  --line: #36405a;
+  --text: #edf2ff;
+  --muted: #a8b1cb;
+  --primary: #65d7ff;
+  --primary-press: #3ab7e0;
+  --secondary: #353f57;
+  --danger: #ff6b6b;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  background: linear-gradient(180deg, #0d1017, var(--bg));
+  color: var(--text);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+body {
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.app-shell {
+  width: min(980px, 100%);
+  margin: 0 auto;
+  padding: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.9rem;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+.subtitle {
+  margin-top: 0.35rem;
+  color: var(--muted);
+}
+
+.camera-frame {
+  position: relative;
+  width: 100%;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #000;
+  aspect-ratio: 3 / 4;
+}
+
+.camera-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.overlay-layer {
+  pointer-events: none;
+}
+
+.controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem;
+}
+
+button {
+  border: none;
+  border-radius: 12px;
+  font-size: 1rem;
+  font-weight: 700;
+  min-height: 48px;
+  padding: 0.85rem 0.95rem;
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+.primary {
+  background: var(--primary);
+  color: #071019;
+}
+
+.primary:hover {
+  background: var(--primary-press);
+}
+
+.secondary {
+  background: var(--secondary);
+  color: var(--text);
+}
+
+button:disabled {
+  opacity: 0.5;
+}
+
+.metric {
+  margin-top: 0.6rem;
+  color: var(--muted);
+}
+
+.status {
+  margin-top: 0.8rem;
+  color: var(--muted);
+}
+
+.status.error {
+  color: var(--danger);
+}
+
+ol {
+  margin: 0.7rem 0 0;
+  padding-left: 1.2rem;
+  color: var(--muted);
+}
+
+@media (min-width: 840px) {
+  .app-shell {
+    grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+    align-items: start;
+  }
+
+  .col-main {
+    display: grid;
+    gap: 1rem;
+  }
+
+  .col-side {
+    display: grid;
+    gap: 1rem;
+    position: sticky;
+    top: calc(1rem + env(safe-area-inset-top));
+  }
+
+  .camera-frame {
+    aspect-ratio: 16 / 10;
+  }
+}
