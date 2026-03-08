@@ -1,106 +1,322 @@
-(() => {
-  const { useEffect, useRef, useState } = React;
+/*
+README (quick start)
+1) Run locally with any static server, for example:
+   - Python: python3 -m http.server 8080
+   - Node: npx serve .
+2) Open http://localhost:8080 on mobile (or desktop for testing).
+3) Allow camera access (or upload a photo), then tap "Scan Dominoes".
 
-  /**
-   * Poll until OpenCV runtime is available.
-   * @returns {Promise<void>}
-   */
+Known limitations
+- Heavy overlap can merge two dominoes into one contour.
+- Very dark scenes or strong glare can still hide some pips.
+- Busy patterned tables can still produce occasional false positives.
+
+Ideas to improve accuracy
+- Add perspective warp from 4 corners before pip analysis per tile.
+- Add temporal smoothing over several frames for stable totals.
+- Add a tiny on-device ML detector for domino proposals + confidence fusion.
+*/
+
+(() => {
+  const elements = {
+    video: document.getElementById("camera"),
+    overlayCanvas: document.getElementById("overlayCanvas"),
+    captureCanvas: document.getElementById("captureCanvas"),
+    debugCanvas: document.getElementById("debugCanvas"),
+    scanBtn: document.getElementById("scanBtn"),
+    resetBtn: document.getElementById("resetBtn"),
+    uploadInput: document.getElementById("uploadInput"),
+    totalPips: document.getElementById("totalPips"),
+    dominoCount: document.getElementById("dominoCount"),
+    perDomino: document.getElementById("perDomino"),
+    status: document.getElementById("status"),
+    debugToggle: document.getElementById("debugToggle"),
+    debugControls: document.getElementById("debugControls"),
+    debugStage: document.getElementById("debugStage")
+  };
+
+  const state = {
+    opencvReady: false,
+    cameraReady: false,
+    stream: null,
+    sourceMode: "camera",
+    uploadedImageBitmap: null,
+    debugEnabled: false,
+    latestDebugStage: "combined",
+    debugMats: new Map()
+  };
+
+  function setStatus(text, isError = false) {
+    elements.status.textContent = text;
+    elements.status.classList.toggle("error", isError);
+  }
+
   function waitForOpenCv() {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+      const timeoutMs = 15000;
+      const start = performance.now();
       const check = () => {
         if (window.cv && window.cv.Mat) {
           resolve();
-        } else {
-          setTimeout(check, 120);
+          return;
         }
+        if (performance.now() - start > timeoutMs) {
+          reject(new Error("OpenCV.js failed to load in time"));
+          return;
+        }
+        setTimeout(check, 100);
       };
       check();
     });
   }
 
-  function App() {
-    const videoRef = useRef(null);
-    const overlayRef = useRef(null);
-    const captureRef = useRef(null);
+  function syncCanvasSizes(width, height) {
+    const w = width || elements.video.videoWidth;
+    const h = height || elements.video.videoHeight;
+    if (!w || !h) {
+      return;
+    }
+    [elements.overlayCanvas, elements.captureCanvas, elements.debugCanvas].forEach((canvas) => {
+      canvas.width = w;
+      canvas.height = h;
+    });
+  }
 
-    const [opencvReady, setOpenCvReady] = useState(false);
-    const [cameraReady, setCameraReady] = useState(false);
-    const [status, setStatus] = useState({ text: "Initializing camera...", isError: false });
-    const [pipTotal, setPipTotal] = useState(0);
-    const [dominoCount, setDominoCount] = useState(0);
+  function clearDebugMats() {
+    state.debugMats.forEach((mat) => mat.delete());
+    state.debugMats.clear();
+  }
 
-    const streamRef = useRef(null);
+  function storeDebugMat(name, mat) {
+    if (!state.debugEnabled) {
+      return;
+    }
+    if (state.debugMats.has(name)) {
+      state.debugMats.get(name).delete();
+    }
+    state.debugMats.set(name, mat.clone());
+  }
 
-    /**
-     * Update status text with optional error style.
-     */
-    const updateStatus = (text, isError = false) => setStatus({ text, isError });
+  function renderDebugStage(stage) {
+    if (!state.debugEnabled) {
+      return;
+    }
+    const mat = state.debugMats.get(stage);
+    if (mat) {
+      cv.imshow(elements.debugCanvas, mat);
+    }
+  }
 
-    /**
-     * Keep overlay and capture canvas in sync with camera frame dimensions.
-     */
-    const syncCanvasSizes = () => {
-      const video = videoRef.current;
-      const overlay = overlayRef.current;
-      const capture = captureRef.current;
-      if (!video || !overlay || !capture || !video.videoWidth || !video.videoHeight) return;
+  function drawRotatedRect(ctx, points, color) {
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 1; i < points.length; i += 1) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
 
-      overlay.width = video.videoWidth;
-      overlay.height = video.videoHeight;
-      capture.width = video.videoWidth;
-      capture.height = video.videoHeight;
-    };
+  function drawOverlays(detections) {
+    const ctx = elements.overlayCanvas.getContext("2d");
+    ctx.clearRect(0, 0, elements.overlayCanvas.width, elements.overlayCanvas.height);
 
-    /**
-     * Draw box + label for each detected domino tile.
-     * @param {Array<{rect: {x:number,y:number,w:number,h:number}, pips:number}>} detections
-     */
-    const drawDetections = (detections) => {
-      const overlay = overlayRef.current;
-      if (!overlay) return;
+    ctx.lineWidth = Math.max(2, Math.round(elements.overlayCanvas.width / 240));
+    ctx.font = `${Math.max(12, Math.round(elements.overlayCanvas.width / 40))}px sans-serif`;
 
-      const ctx = overlay.getContext("2d");
-      ctx.clearRect(0, 0, overlay.width, overlay.height);
-      ctx.lineWidth = 4;
-      ctx.font = "20px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif";
+    detections.forEach((detection, idx) => {
+      const color = detection.confidence >= 0.7 ? "#5dffa1" : "#ffd166";
+      drawRotatedRect(ctx, detection.points, color);
 
-      detections.forEach((detection, idx) => {
-        const { x, y, w, h } = detection.rect;
-        ctx.strokeStyle = "#00ffa3";
-        ctx.strokeRect(x, y, w, h);
+      const anchor = detection.points.reduce((top, point) => (point.y < top.y ? point : top), detection.points[0]);
+      const label = `#${idx + 1} ${detection.pips}p (${Math.round(detection.confidence * 100)}%)`;
+      const tw = ctx.measureText(label).width + 10;
+      const y = Math.max(18, anchor.y - 6);
+      ctx.fillStyle = "rgba(0,0,0,0.75)";
+      ctx.fillRect(anchor.x, y - 16, tw, 18);
+      ctx.fillStyle = "#ffffff";
+      ctx.fillText(label, anchor.x + 5, y - 3);
+    });
+  }
 
-        ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
-        ctx.fillRect(x, Math.max(0, y - 30), 170, 28);
+  function clearUiResults() {
+    elements.totalPips.textContent = "0";
+    elements.dominoCount.textContent = "0";
+    elements.perDomino.textContent = "-";
+    const overlayCtx = elements.overlayCanvas.getContext("2d");
+    overlayCtx.clearRect(0, 0, elements.overlayCanvas.width, elements.overlayCanvas.height);
+    const debugCtx = elements.debugCanvas.getContext("2d");
+    debugCtx.clearRect(0, 0, elements.debugCanvas.width, elements.debugCanvas.height);
+    clearDebugMats();
+  }
 
-        ctx.fillStyle = "#fff";
-        ctx.fillText(`#${idx + 1} pips: ${detection.pips}`, x + 7, Math.max(20, y - 10));
-      });
-    };
+  function getFrameFromSource() {
+    const ctx = elements.captureCanvas.getContext("2d", { willReadFrequently: true });
 
-    /**
-     * Run a heuristic CV pipeline:
-     * 1) contour domino-like rectangles
-     * 2) count circular pip features per rectangle with HoughCircles.
-     */
-    const processFrame = () => {
-      const video = videoRef.current;
-      const capture = captureRef.current;
-      const overlay = overlayRef.current;
-      if (!video || !capture || !overlay) return;
+    if (state.sourceMode === "upload" && state.uploadedImageBitmap) {
+      syncCanvasSizes(state.uploadedImageBitmap.width, state.uploadedImageBitmap.height);
+      ctx.drawImage(state.uploadedImageBitmap, 0, 0);
+      return true;
+    }
 
-      const captureCtx = capture.getContext("2d");
-      captureCtx.drawImage(video, 0, 0, capture.width, capture.height);
+    if (!state.cameraReady || !elements.video.videoWidth || !elements.video.videoHeight) {
+      return false;
+    }
 
-      const src = cv.imread(capture);
-      const gray = new cv.Mat();
-      const blur = new cv.Mat();
-      const thresh = new cv.Mat();
+    syncCanvasSizes();
+    ctx.drawImage(elements.video, 0, 0, elements.captureCanvas.width, elements.captureCanvas.height);
+    return true;
+  }
+
+  function computeIoU(a, b) {
+    const ax2 = a.x + a.w;
+    const ay2 = a.y + a.h;
+    const bx2 = b.x + b.w;
+    const by2 = b.y + b.h;
+    const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x));
+    const iy = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y));
+    const intersection = ix * iy;
+    const union = a.w * a.h + b.w * b.h - intersection;
+    return union > 0 ? intersection / union : 0;
+  }
+
+  function nonMaxSuppression(detections) {
+    const sorted = [...detections].sort((a, b) => b.confidence - a.confidence);
+    const kept = [];
+    for (const candidate of sorted) {
+      const overlaps = kept.some((selected) => computeIoU(candidate.rect, selected.rect) > 0.35);
+      if (!overlaps) {
+        kept.push(candidate);
+      }
+    }
+    return kept;
+  }
+
+  function rotatedPointsFromRect(rotRect) {
+    const box = new cv.Mat();
+    cv.boxPoints(rotRect, box);
+    const points = [];
+    for (let i = 0; i < 4; i += 1) {
+      points.push({ x: box.data32F[i * 2], y: box.data32F[i * 2 + 1] });
+    }
+    box.delete();
+    return points;
+  }
+
+  function countPipsInRect(gray, rect) {
+    const x = Math.max(0, rect.x);
+    const y = Math.max(0, rect.y);
+    const width = Math.min(gray.cols - x, rect.width);
+    const height = Math.min(gray.rows - y, rect.height);
+
+    if (width < 20 || height < 20) {
+      return { pipCount: 0, pipConfidence: 0, pipMask: null };
+    }
+
+    const roi = gray.roi(new cv.Rect(x, y, width, height));
+    const roiBlur = new cv.Mat();
+    const pipMask = new cv.Mat();
+    const pipContours = new cv.MatVector();
+    const pipHierarchy = new cv.Mat();
+
+    cv.GaussianBlur(roi, roiBlur, new cv.Size(5, 5), 0);
+    cv.adaptiveThreshold(
+      roiBlur,
+      pipMask,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv.THRESH_BINARY_INV,
+      19,
+      3
+    );
+
+    const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
+    cv.morphologyEx(pipMask, pipMask, cv.MORPH_OPEN, kernel);
+    kernel.delete();
+
+    cv.findContours(pipMask, pipContours, pipHierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    let pipCount = 0;
+    const roiArea = width * height;
+    let circularHits = 0;
+
+    for (let i = 0; i < pipContours.size(); i += 1) {
+      const blob = pipContours.get(i);
+      const area = cv.contourArea(blob);
+      if (area < roiArea * 0.002 || area > roiArea * 0.06) {
+        blob.delete();
+        continue;
+      }
+
+      const perimeter = cv.arcLength(blob, true);
+      if (!perimeter) {
+        blob.delete();
+        continue;
+      }
+
+      const circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+      const bRect = cv.boundingRect(blob);
+      const ar = bRect.width / Math.max(1, bRect.height);
+
+      if (circularity > 0.45 && ar > 0.55 && ar < 1.6) {
+        pipCount += 1;
+        circularHits += circularity;
+      }
+      blob.delete();
+    }
+
+    const boundedCount = Math.min(12, pipCount);
+    const avgCircularity = pipCount > 0 ? circularHits / pipCount : 0;
+    const pipConfidence = Math.min(1, avgCircularity * 1.2) * (boundedCount > 0 ? 1 : 0.2);
+
+    roi.delete();
+    roiBlur.delete();
+    pipContours.delete();
+    pipHierarchy.delete();
+
+    return { pipCount: boundedCount, pipConfidence, pipMask };
+  }
+
+  function analyzeCurrentFrame() {
+    if (!state.opencvReady) {
+      setStatus("OpenCV loading. Please wait...", true);
+      return;
+    }
+
+    if (!getFrameFromSource()) {
+      setStatus("No frame available. Allow camera or upload a photo.", true);
+      return;
+    }
+
+    setStatus("Scanning...");
+    clearDebugMats();
+
+    let src;
+    let gray;
+    let normalized;
+    let threshold;
+    let edges;
+    let combined;
+    let contours;
+    let hierarchy;
+
+    try {
+      src = cv.imread(elements.captureCanvas);
+      gray = new cv.Mat();
+      normalized = new cv.Mat();
+      threshold = new cv.Mat();
+      edges = new cv.Mat();
+      combined = new cv.Mat();
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
 
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-      cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+      cv.equalizeHist(gray, normalized);
+
       cv.adaptiveThreshold(
-        blur,
-        thresh,
+        normalized,
+        threshold,
         255,
         cv.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv.THRESH_BINARY_INV,
@@ -108,243 +324,262 @@
         7
       );
 
-      const contours = new cv.MatVector();
-      const hierarchy = new cv.Mat();
-      cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      cv.Canny(normalized, edges, 60, 130);
+      const edgeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+      cv.dilate(edges, edges, edgeKernel);
+      cv.bitwise_or(threshold, edges, combined);
+      cv.morphologyEx(combined, combined, cv.MORPH_CLOSE, edgeKernel);
+      edgeKernel.delete();
 
+      storeDebugMat("normalized", normalized);
+      storeDebugMat("threshold", threshold);
+      storeDebugMat("edges", edges);
+      storeDebugMat("combined", combined);
+
+      cv.findContours(combined, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      const frameArea = src.cols * src.rows;
       const detections = [];
+      let lastPipMask = null;
 
       for (let i = 0; i < contours.size(); i += 1) {
         const contour = contours.get(i);
         const area = cv.contourArea(contour);
-
-        if (area < 2200 || area > src.cols * src.rows * 0.35) {
+        if (area < frameArea * 0.01 || area > frameArea * 0.6) {
           contour.delete();
           continue;
         }
 
-        const rect = cv.boundingRect(contour);
-        const ratio = Math.max(rect.width, rect.height) / Math.min(rect.width, rect.height);
-        if (ratio < 1.35 || ratio > 2.75) {
+        const perimeter = cv.arcLength(contour, true);
+        if (!perimeter) {
           contour.delete();
           continue;
         }
 
-        const roi = gray.roi(new cv.Rect(rect.x, rect.y, rect.width, rect.height));
-        const circles = new cv.Mat();
+        const approx = new cv.Mat();
+        cv.approxPolyDP(contour, approx, 0.03 * perimeter, true);
 
-        cv.HoughCircles(
-          roi,
-          circles,
-          cv.HOUGH_GRADIENT,
-          1,
-          Math.max(8, Math.min(rect.width, rect.height) / 8),
-          85,
-          13,
-          4,
-          Math.floor(Math.min(rect.width, rect.height) / 4)
-        );
+        const rotRect = cv.minAreaRect(contour);
+        const width = Math.max(rotRect.size.width, rotRect.size.height);
+        const height = Math.max(1, Math.min(rotRect.size.width, rotRect.size.height));
+        const ratio = width / height;
+
+        const rectArea = rotRect.size.width * rotRect.size.height;
+        const rectangularity = rectArea > 0 ? area / rectArea : 0;
+
+        const hull = new cv.Mat();
+        cv.convexHull(contour, hull, false, true);
+        const hullArea = cv.contourArea(hull);
+        const solidity = hullArea > 0 ? area / hullArea : 0;
+
+        const bbox = cv.boundingRect(contour);
+
+        const angleScore = ratio >= 1.2 && ratio <= 3.4 ? 1 : 0;
+        const shapeScore = Math.max(0, Math.min(1, (rectangularity - 0.45) / 0.45));
+        const solidityScore = Math.max(0, Math.min(1, (solidity - 0.7) / 0.3));
+
+        if (ratio < 1.2 || ratio > 3.4 || rectangularity < 0.45 || solidity < 0.7 || approx.rows < 4) {
+          approx.delete();
+          hull.delete();
+          contour.delete();
+          continue;
+        }
+
+        const { pipCount, pipConfidence, pipMask } = countPipsInRect(normalized, bbox);
+        if (lastPipMask) {
+          lastPipMask.delete();
+        }
+        lastPipMask = pipMask;
+
+        const confidence =
+          0.35 * shapeScore +
+          0.2 * solidityScore +
+          0.15 * angleScore +
+          0.3 * Math.min(1, pipConfidence + (pipCount > 0 ? 0.2 : 0));
+
+        const points = rotatedPointsFromRect(rotRect);
 
         detections.push({
-          rect: { x: rect.x, y: rect.y, w: rect.width, h: rect.height },
-          pips: circles.cols
+          rect: { x: bbox.x, y: bbox.y, w: bbox.width, h: bbox.height },
+          points,
+          pips: pipCount,
+          confidence,
+          meta: {
+            ratio: Number(ratio.toFixed(2)),
+            rectangularity: Number(rectangularity.toFixed(2)),
+            solidity: Number(solidity.toFixed(2)),
+            pipConfidence: Number(pipConfidence.toFixed(2))
+          }
         });
 
-        circles.delete();
-        roi.delete();
+        console.debug("dominoCandidate", {
+          i,
+          area: Math.round(area),
+          ratio: ratio.toFixed(2),
+          rectangularity: rectangularity.toFixed(2),
+          solidity: solidity.toFixed(2),
+          pips: pipCount,
+          confidence: confidence.toFixed(2)
+        });
+
+        approx.delete();
+        hull.delete();
         contour.delete();
       }
 
-      const total = detections.reduce((sum, item) => sum + item.pips, 0);
-      setPipTotal(total);
-      setDominoCount(detections.length);
-      drawDetections(detections);
+      if (lastPipMask) {
+        storeDebugMat("pip", lastPipMask);
+        lastPipMask.delete();
+      }
 
-      if (detections.length > 0) {
-        updateStatus(`Scan complete: ${detections.length} domino(es), ${total} total pips.`);
+      const filtered = nonMaxSuppression(detections).filter((d) => d.confidence >= 0.35);
+      drawOverlays(filtered);
+
+      const total = filtered.reduce((sum, domino) => sum + domino.pips, 0);
+      elements.totalPips.textContent = String(total);
+      elements.dominoCount.textContent = String(filtered.length);
+      elements.perDomino.textContent = filtered.length
+        ? filtered.map((d, idx) => `#${idx + 1}: ${d.pips} (${Math.round(d.confidence * 100)}%)`).join(" · ")
+        : "-";
+
+      if (!filtered.length) {
+        setStatus("Detection uncertain, please rescan", true);
       } else {
-        updateStatus("No dominoes detected. Try brighter light and a higher-contrast table.");
-      }
-
-      src.delete();
-      gray.delete();
-      blur.delete();
-      thresh.delete();
-      contours.delete();
-      hierarchy.delete();
-    };
-
-    const handleScan = () => {
-      if (!opencvReady) {
-        updateStatus("OpenCV is still loading. Please wait...", true);
-        return;
-      }
-      if (!cameraReady) {
-        updateStatus("Camera not ready yet.", true);
-        return;
-      }
-      syncCanvasSizes();
-      processFrame();
-    };
-
-    const handleReset = () => {
-      const overlay = overlayRef.current;
-      if (overlay) {
-        const ctx = overlay.getContext("2d");
-        ctx.clearRect(0, 0, overlay.width, overlay.height);
-      }
-      setPipTotal(0);
-      setDominoCount(0);
-      updateStatus("Reset complete. Ready for next scan.");
-    };
-
-    useEffect(() => {
-      let alive = true;
-
-      const init = async () => {
-        try {
-          // Load OpenCV runtime first so scan is available quickly after camera warmup.
-          await waitForOpenCv();
-          if (!alive) return;
-          setOpenCvReady(true);
-
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: {
-              facingMode: { ideal: "environment" },
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            },
-            audio: false
-          });
-
-          if (!alive) {
-            stream.getTracks().forEach((t) => t.stop());
-            return;
-          }
-
-          streamRef.current = stream;
-          const video = videoRef.current;
-          video.srcObject = stream;
-
-          await new Promise((resolve) => {
-            video.onloadedmetadata = resolve;
-          });
-
-          syncCanvasSizes();
-          setCameraReady(true);
-          updateStatus("Camera ready. Place dominoes flat and tap Scan Dominoes.");
-        } catch (error) {
-          updateStatus(`Initialization failed: ${error.message}`, true);
+        const uncertain = filtered.filter((d) => d.confidence < 0.6 || d.pips === 0).length;
+        if (uncertain > 0) {
+          setStatus(`${filtered.length} dominoes detected (${uncertain} low-confidence)`);
+        } else {
+          setStatus(`${filtered.length} dominoes detected`);
         }
-      };
+      }
 
-      init();
-      window.addEventListener("resize", syncCanvasSizes);
-      window.addEventListener("orientationchange", syncCanvasSizes);
+      state.latestDebugStage = elements.debugStage.value;
+      renderDebugStage(state.latestDebugStage);
 
-      return () => {
-        alive = false;
-        window.removeEventListener("resize", syncCanvasSizes);
-        window.removeEventListener("orientationchange", syncCanvasSizes);
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((track) => track.stop());
-        }
-      };
-    }, []);
-
-    return React.createElement(
-      "main",
-      { className: "app-shell" },
-      React.createElement(
-        "section",
-        { className: "col-main" },
-        React.createElement(
-          "header",
-          { className: "card" },
-          React.createElement("h1", null, "Countino"),
-          React.createElement(
-            "p",
-            { className: "subtitle" },
-            "React mobile app for automatic domino pip counting on iPhone and Android."
-          )
-        ),
-        React.createElement(
-          "section",
-          { className: "card" },
-          React.createElement(
-            "div",
-            { className: "camera-frame" },
-            React.createElement("video", {
-              ref: videoRef,
-              className: "camera-layer",
-              autoPlay: true,
-              playsInline: true,
-              muted: true
-            }),
-            React.createElement("canvas", { ref: overlayRef, className: "camera-layer overlay-layer" })
-          )
-        ),
-        React.createElement(
-          "section",
-          { className: "controls" },
-          React.createElement(
-            "button",
-            {
-              type: "button",
-              className: "primary",
-              onClick: handleScan,
-              disabled: !opencvReady || !cameraReady
-            },
-            "Scan Dominoes"
-          ),
-          React.createElement(
-            "button",
-            {
-              type: "button",
-              className: "secondary",
-              onClick: handleReset
-            },
-            "Reset"
-          )
-        )
-      ),
-      React.createElement(
-        "section",
-        { className: "col-side" },
-        React.createElement(
-          "section",
-          { className: "card", "aria-live": "polite" },
-          React.createElement("h2", null, "Scan Results"),
-          React.createElement(
-            "p",
-            { className: "metric" },
-            React.createElement("strong", null, "Total pip count: "),
-            String(pipTotal)
-          ),
-          React.createElement(
-            "p",
-            { className: "metric" },
-            React.createElement("strong", null, "Dominoes detected: "),
-            String(dominoCount)
-          ),
-          React.createElement("p", { className: `status${status.isError ? " error" : ""}` }, status.text)
-        ),
-        React.createElement(
-          "section",
-          { className: "card" },
-          React.createElement("h2", null, "How to use"),
-          React.createElement(
-            "ol",
-            null,
-            React.createElement("li", null, "Place dominoes on a plain, high-contrast surface."),
-            React.createElement("li", null, "Keep camera parallel to the table and reduce glare."),
-            React.createElement("li", null, "Tap Scan Dominoes and verify the overlay boxes + counts.")
-          )
-        )
-      ),
-      React.createElement("canvas", { ref: captureRef, hidden: true })
-    );
+      console.info("scanSummary", {
+        sourceMode: state.sourceMode,
+        dominoes: filtered.length,
+        totalPips: total,
+        perDomino: filtered.map((d) => ({ pips: d.pips, confidence: d.confidence, meta: d.meta }))
+      });
+    } catch (error) {
+      console.error("scanFailed", error);
+      setStatus(`Scan failed: ${error.message}`, true);
+    } finally {
+      [src, gray, normalized, threshold, edges, combined, hierarchy].forEach((mat) => mat && mat.delete());
+      if (contours) {
+        contours.delete();
+      }
+    }
   }
 
-  ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  async function initCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+
+      state.stream = stream;
+      elements.video.srcObject = stream;
+
+      await new Promise((resolve) => {
+        elements.video.onloadedmetadata = () => resolve();
+      });
+
+      state.cameraReady = true;
+      state.sourceMode = "camera";
+      syncCanvasSizes();
+      setStatus("Camera ready");
+      elements.scanBtn.disabled = !state.opencvReady;
+    } catch (error) {
+      state.cameraReady = false;
+      elements.scanBtn.disabled = false;
+      setStatus("Camera unavailable. Please upload a photo.", true);
+      console.warn("cameraInitFailed", error);
+    }
+  }
+
+  async function init() {
+    setStatus("Loading OpenCV...");
+
+    try {
+      await waitForOpenCv();
+      state.opencvReady = true;
+      setStatus("OpenCV ready. Initializing camera...");
+    } catch (error) {
+      setStatus(error.message, true);
+      console.error(error);
+      return;
+    }
+
+    await initCamera();
+  }
+
+  function bindEvents() {
+    elements.scanBtn.addEventListener("click", analyzeCurrentFrame);
+
+    elements.resetBtn.addEventListener("click", () => {
+      clearUiResults();
+      state.sourceMode = state.cameraReady ? "camera" : "upload";
+      setStatus(state.cameraReady ? "Ready to scan" : "Upload a photo to scan");
+    });
+
+    elements.uploadInput.addEventListener("change", async (event) => {
+      const file = event.target.files?.[0];
+      if (!file) {
+        return;
+      }
+      try {
+        const imageBitmap = await createImageBitmap(file);
+        state.uploadedImageBitmap = imageBitmap;
+        state.sourceMode = "upload";
+        syncCanvasSizes(imageBitmap.width, imageBitmap.height);
+
+        const previewCtx = elements.captureCanvas.getContext("2d");
+        previewCtx.drawImage(imageBitmap, 0, 0);
+        setStatus("Photo ready. Tap Scan Dominoes.");
+        elements.scanBtn.disabled = !state.opencvReady;
+      } catch (error) {
+        setStatus(`Could not read photo: ${error.message}`, true);
+      }
+    });
+
+    elements.debugToggle.addEventListener("change", () => {
+      state.debugEnabled = elements.debugToggle.checked;
+      elements.debugControls.hidden = !state.debugEnabled;
+      elements.debugCanvas.hidden = !state.debugEnabled;
+      if (!state.debugEnabled) {
+        const ctx = elements.debugCanvas.getContext("2d");
+        ctx.clearRect(0, 0, elements.debugCanvas.width, elements.debugCanvas.height);
+      } else {
+        renderDebugStage(elements.debugStage.value);
+      }
+    });
+
+    elements.debugStage.addEventListener("change", () => {
+      state.latestDebugStage = elements.debugStage.value;
+      renderDebugStage(state.latestDebugStage);
+    });
+
+    window.addEventListener("resize", () => {
+      if (state.sourceMode === "camera" && state.cameraReady) {
+        syncCanvasSizes();
+      }
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (state.stream) {
+        state.stream.getTracks().forEach((track) => track.stop());
+      }
+      clearDebugMats();
+    });
+  }
+
+  bindEvents();
+  init();
 })();
