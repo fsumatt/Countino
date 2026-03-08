@@ -204,10 +204,6 @@ Ideas to improve accuracy
     return points;
   }
 
-  function clamp01(value) {
-    return Math.max(0, Math.min(1, value));
-  }
-
   function countPipsInRect(gray, rect) {
     const x = Math.max(0, rect.x);
     const y = Math.max(0, rect.y);
@@ -215,7 +211,7 @@ Ideas to improve accuracy
     const height = Math.min(gray.rows - y, rect.height);
 
     if (width < 20 || height < 20) {
-      return { pipCount: 0, pipConfidence: 0, pipMask: null, meanIntensity: 0 };
+      return { pipCount: 0, pipConfidence: 0, pipMask: null };
     }
 
     const roi = gray.roi(new cv.Rect(x, y, width, height));
@@ -224,10 +220,16 @@ Ideas to improve accuracy
     const pipContours = new cv.MatVector();
     const pipHierarchy = new cv.Mat();
 
-    const meanIntensity = cv.mean(roi)[0];
-
     cv.GaussianBlur(roi, roiBlur, new cv.Size(5, 5), 0);
-    cv.threshold(roiBlur, pipMask, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+    cv.adaptiveThreshold(
+      roiBlur,
+      pipMask,
+      255,
+      cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+      cv.THRESH_BINARY_INV,
+      19,
+      3
+    );
 
     const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(3, 3));
     cv.morphologyEx(pipMask, pipMask, cv.MORPH_OPEN, kernel);
@@ -242,7 +244,7 @@ Ideas to improve accuracy
     for (let i = 0; i < pipContours.size(); i += 1) {
       const blob = pipContours.get(i);
       const area = cv.contourArea(blob);
-      if (area < roiArea * 0.0008 || area > roiArea * 0.035) {
+      if (area < roiArea * 0.002 || area > roiArea * 0.06) {
         blob.delete();
         continue;
       }
@@ -256,14 +258,8 @@ Ideas to improve accuracy
       const circularity = (4 * Math.PI * area) / (perimeter * perimeter);
       const bRect = cv.boundingRect(blob);
       const ar = bRect.width / Math.max(1, bRect.height);
-      const centerX = bRect.x + bRect.width / 2;
-      const centerY = bRect.y + bRect.height / 2;
-      const edgePaddingX = width * 0.06;
-      const edgePaddingY = height * 0.06;
-      const insideTile =
-        centerX > edgePaddingX && centerX < width - edgePaddingX && centerY > edgePaddingY && centerY < height - edgePaddingY;
 
-      if (insideTile && circularity > 0.32 && ar > 0.45 && ar < 1.9) {
+      if (circularity > 0.45 && ar > 0.55 && ar < 1.6) {
         pipCount += 1;
         circularHits += circularity;
       }
@@ -272,15 +268,14 @@ Ideas to improve accuracy
 
     const boundedCount = Math.min(12, pipCount);
     const avgCircularity = pipCount > 0 ? circularHits / pipCount : 0;
-    const countScore = boundedCount > 0 ? clamp01(1 - Math.abs(6 - boundedCount) / 7) : 0;
-    const pipConfidence = clamp01(avgCircularity * 0.7 + countScore * 0.3);
+    const pipConfidence = Math.min(1, avgCircularity * 1.2) * (boundedCount > 0 ? 1 : 0.2);
 
     roi.delete();
     roiBlur.delete();
     pipContours.delete();
     pipHierarchy.delete();
 
-    return { pipCount: boundedCount, pipConfidence, pipMask, meanIntensity };
+    return { pipCount: boundedCount, pipConfidence, pipMask };
   }
 
   function analyzeCurrentFrame() {
@@ -319,12 +314,8 @@ Ideas to improve accuracy
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
       cv.equalizeHist(gray, normalized);
 
-      const blur = new cv.Mat();
-      const brightMask = new cv.Mat();
-      cv.GaussianBlur(normalized, blur, new cv.Size(5, 5), 0);
-
       cv.adaptiveThreshold(
-        blur,
+        normalized,
         threshold,
         255,
         cv.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -350,6 +341,18 @@ Ideas to improve accuracy
       storeDebugMat("edges", edges);
       storeDebugMat("combined", combined);
 
+      cv.Canny(normalized, edges, 60, 130);
+      const edgeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+      cv.dilate(edges, edges, edgeKernel);
+      cv.bitwise_or(threshold, edges, combined);
+      cv.morphologyEx(combined, combined, cv.MORPH_CLOSE, edgeKernel);
+      edgeKernel.delete();
+
+      storeDebugMat("normalized", normalized);
+      storeDebugMat("threshold", threshold);
+      storeDebugMat("edges", edges);
+      storeDebugMat("combined", combined);
+
       cv.findContours(combined, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
       const frameArea = src.cols * src.rows;
@@ -359,7 +362,7 @@ Ideas to improve accuracy
       for (let i = 0; i < contours.size(); i += 1) {
         const contour = contours.get(i);
         const area = cv.contourArea(contour);
-        if (area < frameArea * 0.0025 || area > frameArea * 0.75) {
+        if (area < frameArea * 0.01 || area > frameArea * 0.6) {
           contour.delete();
           continue;
         }
@@ -388,27 +391,28 @@ Ideas to improve accuracy
 
         const bbox = cv.boundingRect(contour);
 
-        const angleScore = ratio >= 1.1 && ratio <= 3.8 ? 1 : 0;
-        const shapeScore = clamp01((rectangularity - 0.3) / 0.55);
-        const solidityScore = clamp01((solidity - 0.45) / 0.5);
+        const angleScore = ratio >= 1.2 && ratio <= 3.4 ? 1 : 0;
+        const shapeScore = Math.max(0, Math.min(1, (rectangularity - 0.45) / 0.45));
+        const solidityScore = Math.max(0, Math.min(1, (solidity - 0.7) / 0.3));
 
-        if (ratio < 1.02 || ratio > 4.2 || rectangularity < 0.26 || solidity < 0.42 || approx.rows < 4 || approx.rows > 14) {
+        if (ratio < 1.2 || ratio > 3.4 || rectangularity < 0.45 || solidity < 0.7 || approx.rows < 4) {
           approx.delete();
           hull.delete();
           contour.delete();
           continue;
         }
 
-        const { pipCount, pipConfidence, pipMask, meanIntensity } = countPipsInRect(gray, bbox);
+        const { pipCount, pipConfidence, pipMask } = countPipsInRect(normalized, bbox);
         if (lastPipMask) {
           lastPipMask.delete();
         }
         lastPipMask = pipMask;
 
-        const lightScore = clamp01((meanIntensity - 85) / 110);
-        const geometryConfidence = 0.5 * shapeScore + 0.25 * solidityScore + 0.15 * angleScore + 0.1 * lightScore;
-        const pipScore = Math.min(1, pipConfidence + (pipCount > 0 ? 0.2 : 0));
-        const confidence = 0.62 * geometryConfidence + 0.38 * pipScore;
+        const confidence =
+          0.35 * shapeScore +
+          0.2 * solidityScore +
+          0.15 * angleScore +
+          0.3 * Math.min(1, pipConfidence + (pipCount > 0 ? 0.2 : 0));
 
         const points = rotatedPointsFromRect(rotRect);
 
@@ -421,9 +425,7 @@ Ideas to improve accuracy
             ratio: Number(ratio.toFixed(2)),
             rectangularity: Number(rectangularity.toFixed(2)),
             solidity: Number(solidity.toFixed(2)),
-            pipConfidence: Number(pipConfidence.toFixed(2)),
-            geometryConfidence: Number(geometryConfidence.toFixed(2)),
-            meanIntensity: Number(meanIntensity.toFixed(1))
+            pipConfidence: Number(pipConfidence.toFixed(2))
           }
         });
 
@@ -447,12 +449,7 @@ Ideas to improve accuracy
         lastPipMask.delete();
       }
 
-      const nmsDetections = nonMaxSuppression(detections);
-      let filtered = nmsDetections.filter((d) => d.confidence >= 0.22);
-      const usedRelaxedFallback = filtered.length === 0 && nmsDetections.length > 0;
-      if (usedRelaxedFallback) {
-        filtered = nmsDetections.filter((d) => d.meta.geometryConfidence >= 0.2);
-      }
+      const filtered = nonMaxSuppression(detections).filter((d) => d.confidence >= 0.35);
       drawOverlays(filtered);
 
       const total = filtered.reduce((sum, domino) => sum + domino.pips, 0);
@@ -466,9 +463,7 @@ Ideas to improve accuracy
         setStatus("Detection uncertain, please rescan", true);
       } else {
         const uncertain = filtered.filter((d) => d.confidence < 0.6 || d.pips === 0).length;
-        if (usedRelaxedFallback) {
-          setStatus(`${filtered.length} possible dominoes detected (low confidence)`, true);
-        } else if (uncertain > 0) {
+        if (uncertain > 0) {
           setStatus(`${filtered.length} dominoes detected (${uncertain} low-confidence)`);
         } else {
           setStatus(`${filtered.length} dominoes detected`);
@@ -480,7 +475,6 @@ Ideas to improve accuracy
 
       console.info("scanSummary", {
         sourceMode: state.sourceMode,
-        contourCount: contours.size(),
         dominoes: filtered.length,
         totalPips: total,
         perDomino: filtered.map((d) => ({ pips: d.pips, confidence: d.confidence, meta: d.meta }))
